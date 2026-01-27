@@ -136,8 +136,70 @@ def get_mlp_activations_at_layer(model, inputs, layer: int) -> torch.Tensor:
         handle.remove()
 
 
+def compute_probe_accuracy_fixed(
+    pos_train: torch.Tensor, 
+    neg_train: torch.Tensor,
+    pos_test: torch.Tensor,
+    neg_test: torch.Tensor,
+) -> float:
+    """
+    Compute accuracy with explicit train/test split (no leakage).
+    
+    Args:
+        pos_train: Positive training examples [n_train_pos, d]
+        neg_train: Negative training examples [n_train_neg, d]
+        pos_test: Positive test examples [n_test_pos, d]
+        neg_test: Negative test examples [n_test_neg, d]
+    """
+    # Convert to float32 for numerical stability
+    pos_train = pos_train.float()
+    neg_train = neg_train.float()
+    pos_test = pos_test.float()
+    neg_test = neg_test.float()
+    
+    n_train_pos, n_train_neg = pos_train.shape[0], neg_train.shape[0]
+    n_test_pos, n_test_neg = pos_test.shape[0], neg_test.shape[0]
+    
+    # Build train/test sets
+    X_train = torch.cat([pos_train, neg_train], dim=0)
+    y_train = torch.tensor([1.0] * n_train_pos + [0.0] * n_train_neg)
+    
+    X_test = torch.cat([pos_test, neg_test], dim=0)
+    y_test = torch.tensor([1.0] * n_test_pos + [0.0] * n_test_neg)
+    
+    # Normalize using training statistics only
+    X_mean = X_train.mean(0, keepdim=True)
+    X_std = X_train.std(0, keepdim=True) + 1e-8
+    X_train_norm = (X_train - X_mean) / X_std
+    X_test_norm = (X_test - X_mean) / X_std
+    
+    # Logistic regression
+    d = X_train.shape[1]
+    w = torch.zeros(d, requires_grad=True)
+    b = torch.zeros(1, requires_grad=True)
+    
+    for _ in range(100):
+        logits = X_train_norm @ w + b
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, y_train)
+        loss.backward()
+        
+        with torch.no_grad():
+            w -= 0.1 * w.grad
+            b -= 0.1 * b.grad
+            w.grad.zero_()
+            b.grad.zero_()
+    
+    # Evaluate on test set
+    with torch.no_grad():
+        test_logits = X_test_norm @ w + b
+        predictions = (test_logits > 0).float()
+        accuracy = (predictions == y_test).float().mean().item()
+    
+    return accuracy
+
+
 def compute_probe_accuracy(pos_acts: torch.Tensor, neg_acts: torch.Tensor) -> float:
-    """Compute accuracy of a simple linear probe."""
+    """Compute accuracy of a simple linear probe (DEPRECATED - has leakage)."""
     # Convert to float32 for numerical stability in training
     pos_acts = pos_acts.float()
     neg_acts = neg_acts.float()
@@ -298,6 +360,13 @@ def run_sparse_probing_neurons(
             positive = examples[keys[0]]
             negative = examples[keys[1]]
             
+            # FIXED: Split into train/test BEFORE feature selection to avoid leakage
+            n_pos, n_neg = len(positive), len(negative)
+            n_train_pos, n_train_neg = n_pos // 2, n_neg // 2
+            
+            pos_train, pos_test = positive[:n_train_pos], positive[n_train_pos:]
+            neg_train, neg_test = negative[:n_train_neg], negative[n_train_neg:]
+            
             # Collect neuron activations
             def get_acts(texts):
                 all_acts = []
@@ -307,18 +376,25 @@ def run_sparse_probing_neurons(
                     all_acts.append(acts[:, -1, :].cpu())
                 return torch.cat(all_acts, dim=0)
             
-            pos_acts = get_acts(positive)
-            neg_acts = get_acts(negative)
+            # Get activations for train and test separately
+            pos_train_acts = get_acts(pos_train)
+            neg_train_acts = get_acts(neg_train)
+            pos_test_acts = get_acts(pos_test)
+            neg_test_acts = get_acts(neg_test)
             
-            # Mean activation difference for feature selection
-            diff = (pos_acts.mean(0) - neg_acts.mean(0)).abs()
+            # FIXED: Feature selection uses ONLY training data
+            diff = (pos_train_acts.mean(0) - neg_train_acts.mean(0)).abs()
             
             concept_results = {}
             for k in k_values:
                 _, top_indices = torch.topk(diff, min(k, diff.numel()))
-                accuracy = compute_probe_accuracy(
-                    pos_acts[:, top_indices],
-                    neg_acts[:, top_indices],
+                
+                # Train on training data, evaluate on test data
+                accuracy = compute_probe_accuracy_fixed(
+                    pos_train_acts[:, top_indices],
+                    neg_train_acts[:, top_indices],
+                    pos_test_acts[:, top_indices],
+                    neg_test_acts[:, top_indices],
                 )
                 concept_results[f"k={k}"] = accuracy
             
