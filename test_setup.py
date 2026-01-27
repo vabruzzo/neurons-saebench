@@ -135,11 +135,19 @@ def test_model_loading(model_name: str = "meta-llama/Llama-3.1-8B-Instruct", dev
     print("  ✓ Tokenizer loaded")
     
     print(f"  Loading model (dtype={dtype})...")
+    
+    # Check if flash attention is available
+    try:
+        import flash_attn
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "eager"
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device_map="auto" if device == "cuda" else None,
-        attn_implementation="flash_attention_2" if device == "cuda" else "eager",
+        attn_implementation=attn_impl,
     )
     model.eval()
     

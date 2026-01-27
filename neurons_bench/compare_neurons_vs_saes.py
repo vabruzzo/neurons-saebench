@@ -95,11 +95,18 @@ def load_model(model_name: str, device: str = "cuda"):
     
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     
+    # Check if flash attention is available
+    try:
+        import flash_attn
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "eager"
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device_map="auto",
-        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
+        attn_implementation=attn_impl,
     )
     model.eval()
     
@@ -131,6 +138,10 @@ def get_mlp_activations_at_layer(model, inputs, layer: int) -> torch.Tensor:
 
 def compute_probe_accuracy(pos_acts: torch.Tensor, neg_acts: torch.Tensor) -> float:
     """Compute accuracy of a simple linear probe."""
+    # Convert to float32 for numerical stability in training
+    pos_acts = pos_acts.float()
+    neg_acts = neg_acts.float()
+    
     n_pos, n_neg = pos_acts.shape[0], neg_acts.shape[0]
     
     if n_pos < 4 or n_neg < 4:
@@ -440,12 +451,16 @@ def main():
     for k in [1, 5, 10, 20, 50]:
         key = f"k={k}"
         neuron = probing_results["neurons"].get(key, 0)
-        sae = probing_results["sae_baseline"].get(key, 0)
-        llm = probing_results["llm_baseline"].get(key, 0)
+        sae = probing_results["sae_baseline"].get(key)
+        llm = probing_results["llm_baseline"].get(key)
+        
+        # Format values, handling None
+        sae_str = f"{sae:>9.1%}" if sae is not None else "      N/A"
+        llm_str = f"{llm:>9.1%}" if llm is not None else "      N/A"
         
         # Highlight if neurons beat LLM baseline
-        marker = "✓" if neuron > llm else " "
-        print(f"{k:>5} | {neuron:>9.1%} | {sae:>9.1%} | {llm:>9.1%} {marker}")
+        marker = "✓" if llm is not None and neuron > llm else " "
+        print(f"{k:>5} | {neuron:>9.1%} | {sae_str} | {llm_str} {marker}")
     
     print("\nPer-concept breakdown:")
     for concept, scores in probing_results["per_concept"].items():

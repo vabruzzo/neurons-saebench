@@ -37,11 +37,18 @@ def setup_model(model_name: str, device: str = "cuda", dtype: torch.dtype = torc
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Check if flash attention is available
+    try:
+        import flash_attn
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "eager"
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device_map="auto",
-        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
+        attn_implementation=attn_impl,
         use_cache=False,  # Disable KV cache for activation hooks
     )
     model.eval()
@@ -265,6 +272,12 @@ def get_mlp_activations(model, inputs, layer: int) -> torch.Tensor:
 
 def train_simple_probe(X_train, y_train, X_test, y_test, epochs=100, lr=0.1):
     """Train a simple logistic regression probe."""
+    # Convert to float32 for numerical stability
+    X_train = X_train.float()
+    X_test = X_test.float()
+    y_train = y_train.float()
+    y_test = y_test.float()
+    
     # Normalize
     X_mean = X_train.mean(dim=0, keepdim=True)
     X_std = X_train.std(dim=0, keepdim=True) + 1e-8
