@@ -6,7 +6,6 @@ https://github.com/TransluceAI/circuits
 """
 
 import torch
-import torch.nn as nn
 from typing import Literal
 from dataclasses import dataclass
 
@@ -93,7 +92,6 @@ def get_neuron_attributions(
         - activations: [n_layers, batch, seq_len, d_mlp] if return_activations=True
     """
     device = input_ids.device
-    batch_size = input_ids.shape[0]
     
     inner = model.model if hasattr(model, 'model') else model
     n_layers = len(inner.layers)

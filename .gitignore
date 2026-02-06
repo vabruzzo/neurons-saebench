@@ -9,8 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
-sae_bench_results_cache/
+# External repos / caches
 circuits/
 SAEBench/
+sae_bench_results_cache/
 
+# IDE / tools
 .mypy_cache/
