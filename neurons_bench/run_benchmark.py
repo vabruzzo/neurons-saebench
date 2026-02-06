@@ -37,18 +37,13 @@ def setup_model(model_name: str, device: str = "cuda", dtype: torch.dtype = torc
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Check if flash attention is available
-    try:
-        import flash_attn
-        attn_impl = "flash_attention_2"
-    except ImportError:
-        attn_impl = "eager"
-    
+    # MUST use eager attention for RelP to work.
+    # Flash attention bypasses ALL_ATTENTION_FUNCTIONS dispatch.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device_map="auto",
-        attn_implementation=attn_impl,
+        attn_implementation="eager",
         use_cache=False,  # Disable KV cache for activation hooks
     )
     model.eval()

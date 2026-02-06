@@ -1,213 +1,47 @@
 """
 RelP (Relevance Propagation) implementation for Llama-style models.
 
-Closely follows Transluce's circuits codebase:
+Uses Transluce's actual circuits codebase directly rather than reimplementing.
 https://github.com/TransluceAI/circuits
-
-Key components:
-1. StraightThroughRMSNorm - detach normalization coefficients
-2. NoQKGradAttention - block gradients through QK attention weights
-3. RelPGatedMLP - detach sigmoid, apply half rule to gate*up
 """
 
+import sys
+import os
 import torch
 import torch.nn as nn
 from typing import Literal
 from dataclasses import dataclass
 
-from transformers.models.llama.modeling_llama import repeat_kv
+# Add circuits to path so we can import directly
+_circuits_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "circuits")
+if _circuits_path not in sys.path:
+    sys.path.insert(0, _circuits_path)
+
+# Import Transluce's actual gradient handling code
+from circuits.core.grad import (
+    stop_nonlinear_grad_for_llama,
+    revert_stop_nonlinear_grad_for_llama,
+)
 
 
 # ============================================================================
-# Custom attention forward that blocks QK gradients
-# (Adapted directly from Transluce's shapley_attention_forward)
-# ============================================================================
-
-def relp_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    """
-    Attention forward where gradients flow ONLY through values,
-    not through the QK attention weight computation.
-    
-    This is critical for RelP: without this, gradients accumulate
-    in early layers through the attention pattern, causing generic
-    early-layer neurons to dominate attribution.
-    """
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    # QK computation - standard matmul (no Shapley)
-    attn_scores = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_scores = attn_scores + causal_mask
-
-    # Softmax - standard (attention weights will have no grad because
-    # we use regular matmul for OV, and the attn_weights path is 
-    # effectively treated as a constant)
-    attn_weights = nn.functional.softmax(
-        attn_scores, dim=-1, dtype=torch.float32
-    ).to(query.dtype)
-
-    attn_weights = nn.functional.dropout(
-        attn_weights, p=dropout, training=module.training
-    )
-
-    # OV computation - regular matmul gives 100% flow to values,
-    # and attn_weights has 0 grad so flow is maintained
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-
-# Register our custom attention function with transformers
-try:
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-    ALL_ATTENTION_FUNCTIONS["relp_no_qk_grad"] = relp_attention_forward
-except ImportError:
-    # Older transformers version - will use hook-based approach
-    ALL_ATTENTION_FUNCTIONS = None
-
-
-# ============================================================================
-# Straight-through estimators for nonlinearities
-# ============================================================================
-
-class StraightThroughRMSNorm(nn.Module):
-    """
-    RMSNorm with straight-through gradient: forward computes real RMSNorm,
-    backward treats normalization constant as frozen.
-    
-    Matches Transluce's StraightThroughLlamaRMSNorm.
-    """
-    def __init__(self, norm_module):
-        super().__init__()
-        self.norm = norm_module
-        self.weight = norm_module.weight
-        self.weight.requires_grad_(False)  # Freeze weight (matches Transluce)
-        self.variance_epsilon = getattr(norm_module, 'variance_epsilon', 
-                                        getattr(norm_module, 'eps', 1e-6))
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, D = x.shape
-        # Compute normalization coefficient and detach it
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        coeff = (torch.rsqrt(variance + self.variance_epsilon)).detach()
-        return x * coeff * self.weight
-
-
-class ShapleyElementwiseMult(torch.autograd.Function):
-    """
-    Elementwise multiplication with Shapley gradient (half rule).
-    Distributes attribution equally to both branches, avoiding double-counting.
-    
-    Matches Transluce's ShapleyElementwiseMult.
-    """
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, y: torch.Tensor, use_half_rule: bool = True):
-        ctx.save_for_backward(x, y)
-        ctx.use_half_rule = use_half_rule
-        return x * y
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        x, y = ctx.saved_tensors
-        factor = 0.5 if ctx.use_half_rule else 1.0
-        return factor * grad_output * y, factor * grad_output * x, None
-
-
-class RelPGatedMLP(nn.Module):
-    """
-    Gated MLP with RelP gradient handling:
-    - Detaches sigmoid from SiLU (treats as constant multiplier)
-    - Applies half rule to gate * up_proj multiplication
-    
-    Matches Transluce's RelPGradMLP.
-    """
-    def __init__(self, mlp_module, use_half_rule: bool = True):
-        super().__init__()
-        self.mlp = mlp_module
-        # Store references for external access (needed for hooks)
-        self.gate_proj = mlp_module.gate_proj
-        self.up_proj = mlp_module.up_proj
-        self.down_proj = mlp_module.down_proj
-        self.use_half_rule = use_half_rule
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # SiLU(x) = x * sigmoid(x)
-        # Detach sigmoid to make it a constant multiplier
-        coeff = torch.sigmoid(self.mlp.gate_proj(x)).detach()
-        gate_proj = self.mlp.gate_proj(x)
-        gate_act = gate_proj * coeff
-        
-        up_branch = self.mlp.up_proj(x)
-        
-        # Apply half rule to the elementwise multiplication
-        combined = ShapleyElementwiseMult.apply(gate_act, up_branch, self.use_half_rule)
-        
-        return self.mlp.down_proj(combined)
-
-
-class NoQKGradAttention(nn.Module):
-    """
-    Wraps an existing attention module so that the softmaxed attention
-    map gets no gradient. Gradients flow only through values.
-    
-    Matches Transluce's NoQKGradAttention.
-    
-    Works by setting _attn_implementation to use our custom forward
-    that blocks QK gradients.
-    """
-    def __init__(self, attn_module):
-        super().__init__()
-        self.attn = attn_module
-        # Store references for external access
-        self.q_proj = attn_module.q_proj
-        self.k_proj = attn_module.k_proj
-        self.v_proj = attn_module.v_proj
-        self.o_proj = attn_module.o_proj
-        
-        # Set the attention implementation to our custom one
-        # This is how Transluce does it - they set config._attn_implementation
-        if hasattr(attn_module, 'config'):
-            self.attn.config._attn_implementation = "relp_no_qk_grad"
-        
-    def forward(self, *args, **kwargs):
-        return self.attn(*args, **kwargs)
-
-
-# ============================================================================
-# Model modification functions
+# Model modification functions (thin wrappers around Transluce's code)
 # ============================================================================
 
 @dataclass
 class RelPState:
-    """Stores original modules for reverting RelP modifications."""
-    original_norm: nn.Module
-    original_layers: dict
-    original_attn_impls: dict  # Store original attention implementations
+    """Stores state for reverting RelP modifications."""
+    applied: bool = False
 
 
 def apply_relp_to_model(model, use_half_rule: bool = True) -> RelPState:
     """
     Apply RelP modifications to a Llama-style model.
     
-    Replaces:
-    1. All RMSNorm layers with straight-through versions
-    2. All attention layers with NoQKGrad versions (blocks QK gradients)
-    3. All MLP layers with RelP versions (detach sigmoid, half rule)
-    
-    This matches Transluce's stop_nonlinear_grad_for_llama with use_relp_grad=True.
+    Uses Transluce's stop_nonlinear_grad_for_llama directly, which:
+    1. Replaces all RMSNorm with StraightThroughLlamaRMSNorm
+    2. Replaces all attention with NoQKGradAttention (blocks QK gradients)
+    3. Replaces all MLP with RelPGradMLP (detach sigmoid, half rule)
     
     Args:
         model: HuggingFace model (LlamaForCausalLM or similar)
@@ -216,71 +50,24 @@ def apply_relp_to_model(model, use_half_rule: bool = True) -> RelPState:
     Returns:
         RelPState object for reverting modifications
     """
-    state = RelPState(
-        original_norm=None,
-        original_layers={},
-        original_attn_impls={},
+    stop_nonlinear_grad_for_llama(
+        model,
+        use_relp_grad=True,
+        use_half_rule=use_half_rule,
     )
-    
-    # Get the inner model
-    inner = model.model if hasattr(model, 'model') else model
-    
-    # Replace final layer norm
-    if hasattr(inner, 'norm'):
-        state.original_norm = inner.norm
-        inner.norm = StraightThroughRMSNorm(inner.norm)
-    
-    # Replace per-layer components
-    for i, layer in enumerate(inner.layers):
-        state.original_layers[i] = {
-            'input_layernorm': layer.input_layernorm,
-            'post_attention_layernorm': layer.post_attention_layernorm,
-            'mlp': layer.mlp,
-            'self_attn': layer.self_attn,
-        }
-        
-        # Store original attention implementation
-        if hasattr(layer.self_attn, 'config'):
-            state.original_attn_impls[i] = getattr(
-                layer.self_attn.config, '_attn_implementation', None
-            )
-        
-        # Replace layernorms
-        layer.input_layernorm = StraightThroughRMSNorm(layer.input_layernorm)
-        layer.post_attention_layernorm = StraightThroughRMSNorm(layer.post_attention_layernorm)
-        
-        # Replace attention with NoQKGrad version (THE CRITICAL FIX)
-        layer.self_attn = NoQKGradAttention(layer.self_attn)
-        
-        # Replace MLP with RelP version
-        layer.mlp = RelPGatedMLP(layer.mlp, use_half_rule=use_half_rule)
     
     # Freeze all parameters (we only want gradients w.r.t. activations)
     for param in model.parameters():
         param.requires_grad = False
     
-    return state
+    return RelPState(applied=True)
 
 
 def revert_relp_from_model(model, state: RelPState):
-    """Revert RelP modifications using saved state."""
-    inner = model.model if hasattr(model, 'model') else model
-    
-    if state.original_norm is not None:
-        inner.norm = state.original_norm
-    
-    for i, layer in enumerate(inner.layers):
-        if i in state.original_layers:
-            orig = state.original_layers[i]
-            layer.input_layernorm = orig['input_layernorm']
-            layer.post_attention_layernorm = orig['post_attention_layernorm']
-            layer.mlp = orig['mlp']
-            layer.self_attn = orig['self_attn']
-            
-            # Restore original attention implementation
-            if i in state.original_attn_impls and hasattr(layer.self_attn, 'config'):
-                if state.original_attn_impls[i] is not None:
-                    layer.self_attn.config._attn_implementation = state.original_attn_impls[i]
+    """Revert RelP modifications using Transluce's revert function."""
+    if state.applied:
+        revert_stop_nonlinear_grad_for_llama(model)
+        state.applied = False
 
 
 # ============================================================================
@@ -330,7 +117,7 @@ def get_neuron_attributions(
     # Register hooks on down_proj
     for i, layer in enumerate(inner.layers):
         mlp = layer.mlp
-        if hasattr(mlp, 'mlp'):  # RelPGatedMLP wrapper
+        if hasattr(mlp, 'mlp'):  # Wrapped MLP (RelPGradMLP etc)
             h = mlp.mlp.down_proj.register_forward_hook(make_hook(i))
         elif hasattr(mlp, 'down_proj'):
             h = mlp.down_proj.register_forward_hook(make_hook(i))

@@ -39,17 +39,13 @@ def load_model(model_name: str, device: str = "cuda"):
     
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     
-    try:
-        import flash_attn
-        attn_impl = "flash_attention_2"
-    except ImportError:
-        attn_impl = "eager"
-    
+    # MUST use eager attention for RelP to work.
+    # Flash attention bypasses ALL_ATTENTION_FUNCTIONS dispatch.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device_map="auto",
-        attn_implementation=attn_impl,
+        attn_implementation="eager",
     )
     model.eval()
     
