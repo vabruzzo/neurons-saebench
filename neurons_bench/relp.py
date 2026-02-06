@@ -5,20 +5,14 @@ Uses Transluce's actual circuits codebase directly rather than reimplementing.
 https://github.com/TransluceAI/circuits
 """
 
-import sys
-import os
 import torch
 import torch.nn as nn
 from typing import Literal
 from dataclasses import dataclass
 
-# Add circuits to path so we can import directly
-_circuits_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "circuits")
-if _circuits_path not in sys.path:
-    sys.path.insert(0, _circuits_path)
-
 # Import Transluce's actual gradient handling code
-from circuits.core.grad import (
+# Copied from https://github.com/TransluceAI/circuits (circuits/core/grad.py)
+from neurons_bench.transluce.grad import (
     stop_nonlinear_grad_for_llama,
     revert_stop_nonlinear_grad_for_llama,
 )
