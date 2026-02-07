@@ -115,22 +115,24 @@ def load_sae(sae_repo: str, layer: int, device: str = "cuda"):
 # SAE feature extraction
 # ============================================================================
 
-def get_mlp_activations_at_layer(model, inputs, layer: int) -> torch.Tensor:
-    """Extract MLP post-activation hidden states at a specific layer."""
+def get_mlp_output_at_layer(model, inputs, layer: int) -> torch.Tensor:
+    """
+    Extract MLP OUTPUT at a specific layer (d_model-sized, after down_proj).
+    This is what the SAE is trained on (hookpoint: layers.N.mlp).
+    """
     activations = {}
 
     def hook(module, inp, out):
-        activations["mlp"] = inp[0].detach()
+        activations["mlp_out"] = out.detach()
 
     inner = model.model if hasattr(model, "model") else model
     mlp = inner.layers[layer].mlp
-    target = mlp.mlp.down_proj if hasattr(mlp, "mlp") else mlp.down_proj
-    handle = target.register_forward_hook(hook)
+    handle = mlp.register_forward_hook(hook)
 
     try:
         with torch.no_grad():
             model(**inputs)
-        return activations["mlp"]
+        return activations["mlp_out"]
     finally:
         handle.remove()
 
@@ -138,19 +140,21 @@ def get_mlp_activations_at_layer(model, inputs, layer: int) -> torch.Tensor:
 @torch.no_grad()
 def get_top_sae_features(
     sae,
-    mlp_acts: torch.Tensor,
+    mlp_output: torch.Tensor,
+    layer: int,
     k: int = 10,
 ) -> list[dict]:
     """
-    Encode MLP activations through SAE, return top-k firing latents.
+    Encode MLP output through SAE, return top-k firing latents.
     
     Args:
         sae: Loaded SAE (from sparsify)
-        mlp_acts: [1, seq_len, d_mlp] MLP activations
+        mlp_output: [1, seq_len, d_model] MLP output (after down_proj)
+        layer: Layer index (for Neuronpedia URLs)
         k: Number of top features to return
     """
     # Get last token activations
-    last_token_acts = mlp_acts[:, -1, :]  # [1, d_mlp]
+    last_token_acts = mlp_output[:, -1, :]  # [1, d_model]
 
     # Encode through SAE
     # sparsify's encode returns a TopK named tuple or similar
@@ -182,7 +186,7 @@ def get_top_sae_features(
         features.append({
             "feature_index": idx.item(),
             "activation": val.item(),
-            "neuronpedia_url": f"https://www.neuronpedia.org/llama-scope/layers.{sae.cfg.hook_layer if hasattr(sae, 'cfg') else '?'}.mlp/{idx.item()}",
+            "neuronpedia_url": f"https://www.neuronpedia.org/llama-scope/layers.{layer}.mlp/{idx.item()}",
         })
 
     return features
@@ -264,11 +268,11 @@ def run_comparison(
             )
 
             # --- SAE features ---
-            # Need MLP activations at the SAE's layer (without RelP interference
-            # on the forward pass — RelP only changes the backward pass, forward is normal)
+            # Get MLP output (d_model-sized, after down_proj) — this is what the SAE encodes.
+            # RelP only changes the backward pass, forward is normal.
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
-            mlp_acts = get_mlp_activations_at_layer(model, inputs, sae_layer)
-            top_sae_features = get_top_sae_features(sae, mlp_acts, k=k)
+            mlp_output = get_mlp_output_at_layer(model, inputs, sae_layer)
+            top_sae_features = get_top_sae_features(sae, mlp_output, sae_layer, k=k)
 
             results.append({
                 "prompt": prompt,
