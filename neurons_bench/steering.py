@@ -30,9 +30,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # ============================================================================
 
 STEERING_CASES = [
+    # Shakespeare: model predicts " William" as first sub-token (53%), not " Shakespeare"
+    # So we test the actual first predicted sub-token
     {
         "prompt": "The author of Romeo and Juliet is",
-        "target": " Shakespeare",
+        "target": " William",
         "neurons": [(23, 13724)],
         "label": "Shakespeare neuron",
     },
@@ -46,19 +48,19 @@ STEERING_CASES = [
         "prompt": "The capital of France is",
         "target": " Paris",
         "neurons": [(31, 12763)],
-        "label": "Paris neuron",
+        "label": "Paris neuron (suppressor)",
     },
     {
         "prompt": "2 + 2 =",
         "target": " 4",
         "neurons": [(31, 11514)],
-        "label": "Math neuron",
+        "label": "Math neuron (suppressor)",
     },
     {
         "prompt": "The color of grass is",
         "target": " green",
         "neurons": [(31, 6411)],
-        "label": "Green neuron",
+        "label": "Green neuron (suppressor)",
     },
     {
         "prompt": "Dogs say",
@@ -243,19 +245,28 @@ def main():
 
             case_results.append(result)
 
-        # Compute effect: how much does ablation (α=0) reduce target probability?
+        # Compute effect: how does ablation (α=0) change target probability?
         baseline = next(r for r in case_results if r["alpha"] == 1.0)
         ablated = next(r for r in case_results if r["alpha"] == 0.0)
-
-        prob_drop = baseline["target_prob"] - ablated["target_prob"]
+        prob_change = ablated["target_prob"] - baseline["target_prob"]
         print(f"\n  Effect of ablation (α=0):")
-        print(f"    P(target) drops: {baseline['target_prob']:.4f} -> {ablated['target_prob']:.4f} (Δ = {prob_drop:+.4f})")
-        print(f"    Rank changes: {baseline['target_rank']} -> {ablated['target_rank']}")
+        print(f"    P(target): {baseline['target_prob']:.4f} -> {ablated['target_prob']:.4f} (Δ = {prob_change:+.4f})")
+        print(f"    Rank: {baseline['target_rank']} -> {ablated['target_rank']}")
 
-        if prob_drop > 0.01:
-            print(f"    ** Causal: ablating this neuron reduces target probability **")
+        if prob_change < -0.01:
+            print(f"    ** PROMOTER: neuron promotes target (ablating reduces P) **")
+        elif prob_change > 0.01:
+            print(f"    ** SUPPRESSOR: neuron suppresses target (ablating increases P) **")
         else:
-            print(f"    Not strongly causal for this specific neuron alone")
+            print(f"    Minimal causal effect for this single neuron")
+
+        # Check monotonicity: does the effect scale smoothly with alpha?
+        probs = [(r["alpha"], r["target_prob"]) for r in case_results]
+        increasing = all(probs[i][1] <= probs[i+1][1] + 0.01 for i in range(len(probs)-1))
+        decreasing = all(probs[i][1] >= probs[i+1][1] - 0.01 for i in range(len(probs)-1))
+        if increasing or decreasing:
+            direction = "increasing" if increasing else "decreasing"
+            print(f"    Monotonic ({direction} with α) — clean causal relationship")
 
         all_results.append({
             "prompt": prompt,
@@ -269,15 +280,24 @@ def main():
     print(f"\n\n{'='*70}")
     print("SUMMARY")
     print(f"{'='*70}")
-    print(f"  {'Neuron':<25} | {'P(α=1)':>8} | {'P(α=0)':>8} | {'Drop':>8} | Causal?")
-    print(f"  {'─'*70}")
+    print(f"  {'Neuron':<25} | {'P(α=0)':>8} | {'P(α=1)':>8} | {'P(α=4)':>8} | {'Δ(0→1)':>8} | Role")
+    print(f"  {'─'*80}")
     for r in all_results:
         baseline_p = next(s["target_prob"] for s in r["steering_results"] if s["alpha"] == 1.0)
         ablated_p = next(s["target_prob"] for s in r["steering_results"] if s["alpha"] == 0.0)
-        drop = baseline_p - ablated_p
-        causal = "YES" if drop > 0.01 else "no"
+        amplified_p = next(s["target_prob"] for s in r["steering_results"] if s["alpha"] == 4.0)
+        change = ablated_p - baseline_p
+        if change < -0.01:
+            role = "PROMOTER"
+        elif change > 0.01:
+            role = "SUPPRESSOR"
+        else:
+            role = "minimal"
         neurons_str = ", ".join(f"L{n['layer']}/N{n['neuron']}" for n in r["neurons"])
-        print(f"  {neurons_str:<25} | {baseline_p:>8.4f} | {ablated_p:>8.4f} | {drop:>+8.4f} | {causal}")
+        print(f"  {neurons_str:<25} | {ablated_p:>8.4f} | {baseline_p:>8.4f} | {amplified_p:>8.4f} | {change:>+8.4f} | {role}")
+
+    print(f"\n  PROMOTER  = neuron promotes target (ablating hurts, amplifying helps)")
+    print(f"  SUPPRESSOR = neuron suppresses target (ablating helps, amplifying hurts)")
 
     # Save
     os.makedirs(args.output_dir, exist_ok=True)
