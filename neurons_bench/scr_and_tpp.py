@@ -454,16 +454,18 @@ def compute_neuron_effects(
     return effects
 
 
-def select_top_n_neurons(effects: torch.Tensor, n: int) -> torch.Tensor:
-    """Select top-N neurons by effect magnitude. Returns boolean mask."""
+def select_top_n_neurons(
+    effects: torch.Tensor, n: int,
+) -> tuple[torch.Tensor, list[int]]:
+    """Select top-N neurons by effect magnitude. Returns (boolean mask, list of neuron indices)."""
     n = min(n, (effects != 0).sum().item())
     if n == 0:
-        return torch.zeros_like(effects, dtype=torch.bool)
+        return torch.zeros_like(effects, dtype=torch.bool), []
 
-    _, top_indices = torch.topk(effects.abs(), n)
+    top_values, top_indices = torch.topk(effects.abs(), n)
     mask = torch.zeros_like(effects, dtype=torch.bool)
     mask[top_indices] = True
-    return mask
+    return mask, top_indices.tolist()
 
 
 def ablate_neurons(
@@ -541,6 +543,7 @@ def run_tpp(
     # 5. Compute effects and ablate
     print("Computing neuron effects and ablating...")
     results = {}
+    ablated_neuron_indices = {}  # Track which neurons were ablated
 
     for ablated_class in chosen_classes:
         effects = compute_neuron_effects(
@@ -548,9 +551,18 @@ def run_tpp(
         )
 
         results[ablated_class] = {}
+        ablated_neuron_indices[ablated_class] = {}
+
         for n in config["n_values"]:
-            neuron_mask = select_top_n_neurons(effects, n)
-            num_ablated = neuron_mask.sum().item()
+            neuron_mask, neuron_ids = select_top_n_neurons(effects, n)
+            ablated_neuron_indices[ablated_class][n] = neuron_ids
+
+            # Report top neurons with transluce URLs
+            if n <= 20:
+                print(f"\n  Class '{ablated_class}', ablating top {n} neurons:")
+                for nid in neuron_ids[:10]:  # Show first 10
+                    print(f"    N{nid} (effect={effects[nid]:.4f})  "
+                          f"https://neurons.transluce.org/{layer}/{nid}/+")
 
             # Ablate and test all classes
             class_accs = {}
@@ -570,6 +582,10 @@ def run_tpp(
         "ablation_results": {
             abl_class: {str(n): accs for n, accs in n_results.items()}
             for abl_class, n_results in results.items()
+        },
+        "ablated_neurons": {
+            abl_class: {str(n): ids for n, ids in n_ids.items()}
+            for abl_class, n_ids in ablated_neuron_indices.items()
         },
         "tpp_metrics": tpp_metrics,
     }
@@ -699,13 +715,23 @@ def run_scr(
         # 4. Compute effects and ablate
         print("  Computing effects and ablating...")
         ablation_results = {}
+        scr_ablated_neurons = {}
         for ablated_class in chosen_classes:
             effects = compute_neuron_effects(
                 probes[ablated_class], ablated_class, train_acts, perform_scr=True,
             )
             ablation_results[ablated_class] = {}
+            scr_ablated_neurons[ablated_class] = {}
             for n in config["n_values"]:
-                neuron_mask = select_top_n_neurons(effects, n)
+                neuron_mask, neuron_ids = select_top_n_neurons(effects, n)
+                scr_ablated_neurons[ablated_class][n] = neuron_ids
+
+                # Report top neurons with transluce URLs
+                if n <= 10:
+                    print(f"\n    Class '{ablated_class}', ablating top {n} neurons:")
+                    for nid in neuron_ids[:5]:
+                        print(f"      N{nid} (effect={effects[nid]:.4f})  "
+                              f"https://neurons.transluce.org/{layer}/{nid}/+")
 
                 class_accs = {}
                 for eval_class in chosen_classes:
@@ -738,6 +764,10 @@ def run_scr(
         all_pair_results[pair_name] = {
             "clean_accuracies": scr_clean_accs,
             "scr_metrics": scr_metrics,
+            "ablated_neurons": {
+                abl_class: {str(n): ids for n, ids in n_ids.items()}
+                for abl_class, n_ids in scr_ablated_neurons.items()
+            },
         }
 
     return all_pair_results
